@@ -156,16 +156,33 @@ public class FieldInfo extends ClassMemberInfo implements Comparable<FieldInfo> 
                 try {
                     typeDescriptor = TypeSignature.parse(typeDescriptorStr, declaringClassName);
                     typeDescriptor.setScanResult(scanResult);
-                    if (typeAnnotationDecorators != null) {
-                        for (final TypeAnnotationDecorator decorator : typeAnnotationDecorators) {
-                            decorator.decorate(typeDescriptor);
-                        }
-                    }
+                    decorateType(typeDescriptor);
                 } catch (final ParseException e) {
                     throw new IllegalArgumentException(e);
                 }
             }
             return typeDescriptor;
+        }
+    }
+
+    /**
+     * Run the type annotation decorators on the given parsed field type. Any individual type annotation that
+     * cannot be matched to the type (e.g. an unresolvable nested type, or a compiler bug) is skipped rather than
+     * being allowed to abort parsing of the whole field type. (#897)
+     *
+     * @param fieldType
+     *            the parsed field type signature or descriptor to decorate.
+     */
+    private void decorateType(final TypeSignature fieldType) {
+        if (typeAnnotationDecorators != null) {
+            for (final TypeAnnotationDecorator decorator : typeAnnotationDecorators) {
+                try {
+                    decorator.decorate(fieldType);
+                } catch (final IllegalArgumentException e) {
+                    // Skip a type annotation that cannot be matched to the field type, rather than failing to
+                    // produce the whole field type (best effort). (#897)
+                }
+            }
         }
     }
 
@@ -190,11 +207,7 @@ public class FieldInfo extends ClassMemberInfo implements Comparable<FieldInfo> 
                 try {
                     typeSignature = TypeSignature.parse(typeSignatureStr, declaringClassName);
                     typeSignature.setScanResult(scanResult);
-                    if (typeAnnotationDecorators != null) {
-                        for (final TypeAnnotationDecorator decorator : typeAnnotationDecorators) {
-                            decorator.decorate(typeSignature);
-                        }
-                    }
+                    decorateType(typeSignature);
                 } catch (final ParseException e) {
                     throw new IllegalArgumentException(
                             "Invalid type signature for field " + getClassName() + "." + getName()

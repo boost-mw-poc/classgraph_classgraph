@@ -188,55 +188,104 @@ public class MethodInfo extends ClassMemberInfo implements Comparable<MethodInfo
                     typeDescriptor = MethodTypeSignature.parse(typeDescriptorStr, declaringClassName);
                     typeDescriptor.setScanResult(scanResult);
                     if (typeAnnotationDecorators != null) {
-                        // It is possible that there are extra implicit params added at the beginning of the
-                        // parameter list that type annotations don't take into account. Assume that the
-                        // type signature has the correct number of parameters, and temporarily remove any
-                        // implicit prefix parameters during the type decoration process. See getParameterInfo().
-                        int sigNumParam = 0;
+                        // Type annotations index formal parameters starting from the first parameter that was
+                        // declared in source code. However, the method type descriptor may begin with extra
+                        // implicit (compiler-synthesized) parameters that formal_parameter_index does not count
+                        // -- e.g. the leading enclosing-instance parameter of a non-static inner class
+                        // constructor, or the leading (String name, int ordinal) parameters of an enum
+                        // constructor. Determine how many such implicit prefix parameters there are, strip them
+                        // from the descriptor while running the decorators so that formal_parameter_index lines
+                        // up, then restore them. See also getParameterInfo(), which "right-aligns" parameter
+                        // metadata for the same reason. (#897)
+                        final int descNumParam = typeDescriptor.getParameterTypeSignatures().size();
+                        int numImplicitPrefixParams;
                         final MethodTypeSignature sig = getTypeSignature();
-                        if (sig == null) {
-                            // There is no type signature -- run type annotation decorators on descriptor
-                            for (final MethodTypeAnnotationDecorator decorator : typeAnnotationDecorators) {
-                                decorator.decorate(typeDescriptor);
-                            }
+                        if (sig != null) {
+                            // The generic type signature omits implicit prefix parameters, so the difference in
+                            // parameter count reveals how many there are (the spec-sanctioned relationship).
+                            numImplicitPrefixParams = descNumParam - sig.getParameterTypeSignatures().size();
                         } else {
-                            // Determine how many extra implicit params there are
-                            sigNumParam = sig.getParameterTypeSignatures().size();
-                            final int descNumParam = typeDescriptor.getParameterTypeSignatures().size();
-                            final int numImplicitPrefixParams = descNumParam - sigNumParam;
-                            if (numImplicitPrefixParams < 0) {
-                                // Sanity check -- should not happen
-                                throw new IllegalArgumentException(
-                                        "Fewer params in method type descriptor than in method type signature");
-                            } else if (numImplicitPrefixParams == 0) {
-                                // There are no implicit prefix params --
-                                // run type annotation decorators on descriptor
-                                for (final MethodTypeAnnotationDecorator decorator : typeAnnotationDecorators) {
-                                    decorator.decorate(typeDescriptor);
-                                }
-                            } else {
-                                // There are implicit prefix params -- strip them temporarily from type descriptor,
-                                // then run decorators, then add them back again
-                                final List<TypeSignature> paramSigs = typeDescriptor.getParameterTypeSignatures();
-                                final List<TypeSignature> strippedParamSigs = paramSigs.subList(0,
-                                        numImplicitPrefixParams);
-                                for (int i = 0; i < numImplicitPrefixParams; i++) {
-                                    paramSigs.remove(0);
-                                }
-                                for (final MethodTypeAnnotationDecorator decorator : typeAnnotationDecorators) {
-                                    decorator.decorate(typeDescriptor);
-                                }
-                                for (int i = numImplicitPrefixParams - 1; i >= 0; --i) {
-                                    paramSigs.add(0, strippedParamSigs.get(i));
-                                }
-                            }
+                            // There is no generic type signature (e.g. a non-generic inner-class or enum
+                            // constructor), so determine the number of implicit prefix params structurally.
+                            numImplicitPrefixParams = getNumImplicitPrefixParams();
                         }
+                        // Clamp to a sane range, in case of a compiler bug or a malformed classfile
+                        if (numImplicitPrefixParams < 0) {
+                            numImplicitPrefixParams = 0;
+                        } else if (numImplicitPrefixParams > descNumParam) {
+                            numImplicitPrefixParams = descNumParam;
+                        }
+                        decorateMethodType(typeDescriptor, numImplicitPrefixParams);
                     }
                 } catch (final ParseException e) {
                     throw new IllegalArgumentException(e);
                 }
             }
             return typeDescriptor;
+        }
+    }
+
+    /**
+     * Determine the number of implicit (compiler-synthesized) parameters at the start of this method's
+     * parameter list that are not counted by the {@code formal_parameter_index} of type annotations. This is
+     * used only when there is no generic type signature to compare the descriptor against. Currently handles
+     * the two standard Java cases: the leading enclosing-instance parameter of a non-static inner class
+     * constructor, and the leading {@code (String name, int ordinal)} parameters of an enum constructor.
+     * (Local and anonymous classes may add a varying number of synthetic params, and are deliberately not
+     * special-cased here -- any resulting mismatch is handled gracefully by {@link #decorateMethodType}.)
+     * (#897)
+     *
+     * @return the number of implicit prefix parameters (0 if none, or if it cannot be determined).
+     */
+    private int getNumImplicitPrefixParams() {
+        if ("<init>".equals(name)) {
+            final ClassInfo declaringClassInfo = getClassInfo();
+            if (declaringClassInfo != null) {
+                if (declaringClassInfo.isEnum()) {
+                    // enum constructors have two leading synthetic params: (String name, int ordinal)
+                    return 2;
+                } else if (declaringClassInfo.isInnerClass() && !declaringClassInfo.isStatic()) {
+                    // Non-static inner class constructors have a leading enclosing-instance parameter
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Run the method type annotation decorators on the given parsed method type, temporarily stripping the
+     * given number of implicit prefix parameters so that {@code formal_parameter_index} values line up with
+     * the source-declared parameters. Any individual type annotation that cannot be matched to a parameter
+     * type (e.g. due to compiler-specific parameter indexing, as with Kotlin, local or anonymous classes, or
+     * a compiler bug) is skipped rather than being allowed to abort parsing of the whole method type. (#897)
+     *
+     * @param methodType
+     *            the parsed method type signature or descriptor to decorate.
+     * @param numImplicitPrefixParams
+     *            the number of implicit prefix parameters to strip while decorating (0 for none).
+     */
+    private void decorateMethodType(final MethodTypeSignature methodType, final int numImplicitPrefixParams) {
+        final List<TypeSignature> paramSigs = methodType.getParameterTypeSignatures();
+        // Take a copy of the implicit prefix params before removing them -- do not use the live view returned
+        // by List.subList(), since it would be invalidated by the structural modification of paramSigs below.
+        final List<TypeSignature> implicitPrefixParams = numImplicitPrefixParams <= 0 ? null
+                : new ArrayList<>(paramSigs.subList(0, numImplicitPrefixParams));
+        for (int i = 0; i < numImplicitPrefixParams; i++) {
+            paramSigs.remove(0);
+        }
+        for (final MethodTypeAnnotationDecorator decorator : typeAnnotationDecorators) {
+            try {
+                decorator.decorate(methodType);
+            } catch (final IllegalArgumentException e) {
+                // Skip a type annotation that cannot be matched to a parameter type, rather than failing to
+                // produce the whole method type (best effort). (#897)
+            }
+        }
+        if (implicitPrefixParams != null) {
+            for (int i = numImplicitPrefixParams - 1; i >= 0; --i) {
+                paramSigs.add(0, implicitPrefixParams.get(i));
+            }
         }
     }
 
@@ -259,9 +308,9 @@ public class MethodInfo extends ClassMemberInfo implements Comparable<MethodInfo
                     typeSignature = MethodTypeSignature.parse(typeSignatureStr, declaringClassName);
                     typeSignature.setScanResult(scanResult);
                     if (typeAnnotationDecorators != null) {
-                        for (final MethodTypeAnnotationDecorator decorator : typeAnnotationDecorators) {
-                            decorator.decorate(typeSignature);
-                        }
+                        // The generic type signature already omits any implicit prefix parameters, so
+                        // formal_parameter_index lines up with it directly (strip 0). (#897)
+                        decorateMethodType(typeSignature, 0);
                     }
                 } catch (final ParseException e) {
                     throw new IllegalArgumentException(

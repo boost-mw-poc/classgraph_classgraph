@@ -1,0 +1,27 @@
+import org.objectweb.asm.*;
+import java.nio.file.*;
+public class Gen {
+  public static void main(String[] a) throws Exception {
+    String owner = "io/github/classgraph/issues/issue897/fieldcrash/BadFieldTypePath";
+    String anno = "Lio/github/classgraph/issues/issue897/fieldcrash/FieldAnno;";
+    int fieldRef = TypeReference.newTypeReference(TypeReference.FIELD).getValue();
+    ClassWriter cw = new ClassWriter(0);
+    cw.visit(Opcodes.V1_8, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER, owner, null, "java/lang/Object", null);
+    // default constructor
+    MethodVisitor mv = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null);
+    mv.visitCode(); mv.visitVarInsn(Opcodes.ALOAD,0);
+    mv.visitMethodInsn(Opcodes.INVOKESPECIAL,"java/lang/Object","<init>","()V",false);
+    mv.visitInsn(Opcodes.RETURN); mv.visitMaxs(1,1); mv.visitEnd();
+    // valid: String field, type annotation at empty path -> @FieldAnno on String
+    FieldVisitor f1 = cw.visitField(Opcodes.ACC_PUBLIC, "validlyAnnotated", "Ljava/lang/String;", null, null);
+    f1.visitTypeAnnotation(fieldRef, null, anno, true).visitEnd();
+    f1.visitEnd();
+    // bogus: String field, type annotation at [ARRAY] path -> invalid on a non-array type (simulates JDK-8385663-style bad path)
+    FieldVisitor f2 = cw.visitField(Opcodes.ACC_PUBLIC, "bogusArrayPath", "Ljava/lang/String;", null, null);
+    f2.visitTypeAnnotation(fieldRef, TypePath.fromString("["), anno, true).visitEnd();
+    f2.visitEnd();
+    cw.visitEnd();
+    Files.write(Paths.get(owner.substring(owner.lastIndexOf('/')+1) + ".class"), cw.toByteArray());
+    System.out.println("generated BadFieldTypePath.class");
+  }
+}

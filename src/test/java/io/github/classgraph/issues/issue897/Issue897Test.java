@@ -42,6 +42,18 @@ public class Issue897Test {
     public class Inner2 {
     }
 
+    /**
+     * Generic inner class: its constructor has a generic {@code Signature}, so the implicit enclosing-instance
+     * parameter is detected by comparing the descriptor and signature parameter counts. This exercises the
+     * implicit-prefix strip/restore path, which previously threw {@link java.util.ConcurrentModificationException}
+     * on a direct {@link MethodInfo#getTypeDescriptor()} call.
+     */
+    private class Inner3<T> {
+        @SuppressWarnings("unused")
+        public Inner3(@Anno List<T> list) {
+        }
+    }
+
     /** Type-use annotation. */
     @Target(TYPE_USE)
     @interface Anno {
@@ -80,10 +92,11 @@ public class Issue897Test {
      */
     @Test
     public void annotationOnInnerClassConstructor() {
-        // Scan the whole package, so that the nested-class relationship between Issue897Test and Inner2 can be
-        // resolved when placing the type annotation (which carries an INNER_TYPE type path).
+        // Scan this package non-recursively, so that the nested-class relationship between Issue897Test and Inner2
+        // can be resolved when placing the type annotation (which carries an INNER_TYPE type path), without pulling
+        // in the compiler-specific fixture sub-packages (ecjenum, fieldcrash).
         try (ScanResult scanResult = new ClassGraph()
-                .acceptPackages(Issue897Test.class.getPackage().getName())
+                .acceptPackagesNonRecursive(Issue897Test.class.getPackage().getName())
                 .ignoreClassVisibility().enableMethodInfo().enableAnnotationInfo().scan()) {
             final ClassInfo classInfo = scanResult.getClassInfo(Inner1.class.getName());
             final MethodInfo methodInfo = classInfo.getDeclaredConstructorInfo().get(0);
@@ -104,6 +117,34 @@ public class Issue897Test {
             // ...and not to the compiler-generated enclosing-instance parameter.
             assertThat(typeAnnotationNames(parameterInfo[0].getTypeSignatureOrTypeDescriptor()))
                     .doesNotContain(annoName);
+        }
+    }
+
+    /**
+     * Test that a constructor of a <i>generic</i> inner class can be decorated without throwing. The implicit
+     * enclosing-instance parameter is detected here via the descriptor/signature parameter-count difference, and a
+     * direct {@link MethodInfo#getTypeDescriptor()} call previously threw
+     * {@link java.util.ConcurrentModificationException} because the implicit-prefix strip/restore used a
+     * {@link java.util.List#subList} view that was invalidated by mutation of the backing list. (#897)
+     */
+    @Test
+    public void annotationOnGenericInnerClassConstructor() {
+        try (ScanResult scanResult = new ClassGraph()
+                .acceptPackagesNonRecursive(Issue897Test.class.getPackage().getName())
+                .ignoreClassVisibility().enableMethodInfo().enableAnnotationInfo().scan()) {
+            final ClassInfo classInfo = scanResult.getClassInfo(Inner3.class.getName());
+            final MethodInfo methodInfo = classInfo.getDeclaredConstructorInfo().get(0);
+
+            // Must not throw ConcurrentModificationException on a direct type-descriptor call (#897).
+            methodInfo.getTypeDescriptor();
+            methodInfo.getTypeSignatureOrTypeDescriptor();
+
+            // The @Anno must be attached to the List parameter (the source-declared parameter), not the
+            // compiler-generated enclosing-instance parameter.
+            final MethodParameterInfo[] parameterInfo = methodInfo.getParameterInfo();
+            final MethodParameterInfo listParam = parameterInfo[parameterInfo.length - 1];
+            assertThat(typeAnnotationNames(listParam.getTypeSignatureOrTypeDescriptor()))
+                    .contains(Anno.class.getName());
         }
     }
 }
